@@ -1,0 +1,17 @@
+# Rust: the build directory. (mbx points it at a shared cache; a plain cargo
+# build writes it here.)
+/target
+
+# Secrets.
+.env
+
+# macOS
+.DS_Store
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.zcode/

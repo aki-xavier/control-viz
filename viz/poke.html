@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>simu poke — 鼠标注入外力</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #10141a; }
+  #hud {
+    position: fixed; left: 12px; top: 12px; padding: 10px 14px;
+    background: rgba(16,20,26,.82); color: #cfd8e3; border-radius: 8px;
+    font: 12px/1.7 ui-monospace, "SF Mono", Menlo, monospace; z-index: 10;
+    font-variant-numeric: tabular-nums; min-width: 250px;
+  }
+  #hud b { color: #8ab4f8; font-weight: 600; }
+  #hud .force { color: #f6c177; }
+  #hint {
+    position: fixed; left: 12px; bottom: 12px; color: #7b8ea3;
+    font: 12px/1.6 -apple-system, "PingFang SC", sans-serif; z-index: 10;
+  }
+  #hint kbd {
+    background: #22303f; border: 1px solid #3a4a5c; border-radius: 4px;
+    padding: 1px 5px; color: #cfd8e3;
+  }
+  #status {
+    position: fixed; right: 12px; top: 12px; padding: 6px 10px;
+    background: rgba(16,20,26,.82); color: #9ad1a9; border-radius: 6px;
+    font: 12px/1.5 ui-monospace, Menlo, monospace; z-index: 10;
+  }
+  .err { color: #f28b82 !important; }
+  button {
+    background: #22303f; color: #cfd8e3; border: 1px solid #3a4a5c;
+    border-radius: 5px; padding: 3px 9px; cursor: pointer;
+    font: 12px/1.5 -apple-system, sans-serif; margin-top: 8px;
+  }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div>t = <b id="t">0.000</b> s &nbsp; ticks <b id="ticks">0</b></div>
+  <div>实时因子 <b id="rtf">–</b> &nbsp; 本帧 <b id="wall">–</b> ms</div>
+  <div class="force">外力 |F| = <b id="fmag">0</b> N</div>
+  <div>CoM y = <b id="comy">–</b> m &nbsp; 倾角 <b id="tilt">–</b> rad</div>
+  <div>足底力 L/R = <b id="fz">–</b> N</div>
+  <div>基座 z = <b id="bz">–</b> m</div>
+  <div style="margin-top:8px">
+    <label><input type="checkbox" id="latch"> 保持外力（松开后不撤销）</label><br>
+    <label><input type="checkbox" id="pause"> 暂停（冻结后拖拽施力再继续）</label>
+  </div>
+  <button id="reset">重置场景</button>
+  <button id="clear">清除外力</button>
+</div>
+<div id="status">连接中…</div>
+<div id="hint">
+  在机器人任意连杆上按住左键拖动 = 注入外力（拖动越长力越大，<kbd>Shift</kbd> ×5）；
+  松开撤销；勾选「保持外力」则松开后继续施力。空白处拖动 / 滚轮 = 旋转与缩放视角。
+</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/three.module.js",
+    "three/addons/loaders/STLLoader.js": "/lib/STLLoader.js",
+    "three/addons/controls/OrbitControls.js": "/lib/OrbitControls.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ---- scene -----------------------------------------------------------------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x10141a);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 1e-3, 50);
+camera.position.set(1.15, 0.95, 1.15);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.42, 0);
+controls.enableDamping = true;
+controls.update();
+
+scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x203040, 1.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.7);
+sun.position.set(1.5, 2.0, 1.2);
+scene.add(sun);
+
+// the sim world is z-up; three.js is y-up. The force vector crossing this
+// boundary must be converted too (see toSim below).
+const worldRoot = new THREE.Group();
+worldRoot.rotation.x = -Math.PI / 2;
+scene.add(worldRoot);
+
+// ground at sim z = 0 (identity under worldRoot: sim xy is the three XZ plane)
+const grid = new THREE.GridHelper(6, 60, 0x2c3e50, 0x1c2836);
+scene.add(grid);
+const floor = new THREE.Mesh(
+  new THREE.PlaneGeometry(6, 6),
+  new THREE.MeshStandardMaterial({ color: 0x1a2531, roughness: 0.95, transparent: true, opacity: 0.92 })
+);
+floor.rotation.x = -Math.PI / 2;
+scene.add(floor);
+
+// three.js world -> sim world (the inverse of worldRoot's -90deg X rotation)
+function toSim(v) { return new THREE.Vector3(v.x, -v.z, v.y); }
+
+// ---- link meshes -----------------------------------------------------------
+const palette = [0x8ab4f8, 0xf6c177, 0x9ad1a9, 0xf28b82, 0xc5a3ff, 0x76d7c4,
+                 0xf9e2af, 0xa3c9f1, 0xefb1d2, 0xb7e3c0, 0xd0b49e, 0x93b8c4,
+                 0xd7aefb, 0x9fb8ad, 0xe8c39e];
+const loader = new STLLoader();
+const linkGroups = [];
+
+function makeVisual(v, color) {
+  return new Promise((resolve) => {
+    loader.load(v.mesh, (geom) => {
+      const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({
+        color, metalness: 0.15, roughness: 0.75
+      }));
+      mesh.position.set(v.op[0], v.op[1], v.op[2]);
+      mesh.quaternion.set(v.oq[1], v.oq[2], v.oq[3], v.oq[0]);
+      mesh.scale.set(v.scale[0], v.scale[1], v.scale[2]);
+      resolve(mesh);
+    }, undefined, () => resolve(null));
+  });
+}
+
+async function buildLink(def, color) {
+  const group = new THREE.Group();
+  for (const mesh of await Promise.all(def.visuals.map(v => makeVisual(v, color)))) {
+    if (mesh) group.add(mesh);
+  }
+  group.userData.linkIndex = linkGroups.length;
+  worldRoot.add(group);
+  linkGroups.push(group);
+  return group;
+}
+
+// ---- force interaction -----------------------------------------------------
+const N_PER_PX = 1.6;        // drag scale: pixels -> newtons
+const F_MAX = 400;           // cap so a long drag cannot teleport the robot
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+const arrow = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(), 0.25, 0xf6c177, 0.06, 0.04);
+arrow.visible = false;
+scene.add(arrow);
+const anchor = new THREE.Mesh(
+  new THREE.SphereGeometry(0.008, 12, 12),
+  new THREE.MeshBasicMaterial({ color: 0xf6c177 })
+);
+anchor.visible = false;
+scene.add(anchor);
+
+// an active press: link index, the grab point in the link's frame, the
+// screen-space drag origin, and the current force (three.js world frame)
+let drag = null;
+
+function pickLink(ev) {
+  pointer.x = (ev.clientX / innerWidth) * 2 - 1;
+  pointer.y = -(ev.clientY / innerHeight) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const hits = raycaster.intersectObjects(linkGroups, true);
+  if (hits.length === 0) return null;
+  let obj = hits[0].object;
+  while (obj && obj.userData.linkIndex === undefined) obj = obj.parent;
+  if (!obj) return null;
+  return { link: obj.userData.linkIndex, point: hits[0].point };
+}
+
+renderer.domElement.addEventListener('pointerdown', (ev) => {
+  if (ev.button !== 0) return;
+  const hit = pickLink(ev);
+  if (!hit) return;                       // background: let OrbitControls orbit
+  controls.enabled = false;
+  // keep the grab point in the link's own frame: the link moves while the
+  // press is applied, and the wrench must stay at the place that was grabbed
+  const group = linkGroups[hit.link];
+  drag = {
+    link: hit.link,
+    local: group.worldToLocal(hit.point.clone()),
+    start: { x: ev.clientX, y: ev.clientY },
+    force: new THREE.Vector3(),
+    world: hit.point.clone()
+  };
+  anchor.position.copy(hit.point);
+  anchor.visible = true;
+  arrow.position.copy(hit.point);
+  arrow.visible = true;
+  renderer.domElement.setPointerCapture(ev.pointerId);
+});
+
+function dragPoint() {
+  if (!drag) return null;
+  drag.world = linkGroups[drag.link].localToWorld(drag.local.clone());
+  return drag.world;
+}
+
+renderer.domElement.addEventListener('pointermove', (ev) => {
+  if (!drag) return;
+  const dx = ev.clientX - drag.start.x;
+  const dy = ev.clientY - drag.start.y;
+  const px = Math.hypot(dx, dy);
+  if (px < 1e-3) return;
+  // the drag direction in screen space, lifted into the world through the
+  // camera's own basis, so "pull right" pushes right on screen
+  const right = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0);
+  const up = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1);
+  const dir = right.multiplyScalar(dx / px).add(up.multiplyScalar(-dy / px)).normalize();
+  const gain = ev.shiftKey ? 5 : 1;
+  const mag = Math.min(px * N_PER_PX * gain, F_MAX);
+  drag.force.copy(dir.multiplyScalar(mag));
+  arrow.setDirection(drag.force.clone().normalize());
+  arrow.setLength(0.08 + 0.35 * (mag / F_MAX), 0.05, 0.035);
+});
+
+let lastSent = 0;
+function sendForce(f) {
+  const now = performance.now();
+  const pt = dragPoint();
+  if (pt) { anchor.position.copy(pt); arrow.position.copy(pt); }
+  if (now - lastSent < 33) return;        // ~30 Hz is plenty for a hand
+  lastSent = now;
+  const sf = toSim(f);
+  const sp = pt ? toSim(pt) : new THREE.Vector3();
+  fetch('/force', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ link: drag ? drag.link : -1, p: [sp.x, sp.y, sp.z], f: [sf.x, sf.y, sf.z] })
+  }).catch(() => {});
+}
+
+function endDrag() {
+  if (!drag) return;
+  const keep = el('latch').checked;
+  if (keep) {
+    // latch: the press stays applied after the mouse is released, so the
+    // user can watch a sustained force play out (and move the camera)
+    held = { link: drag.link, local: drag.local, force: drag.force.clone() };
+  }
+  drag = null;
+  controls.enabled = true;
+  if (keep) return;   // arrow and anchor stay visible on the held force
+  arrow.visible = false;
+  anchor.visible = false;
+  fetch('/force', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ link: -1, f: [0, 0, 0] })
+  }).catch(() => {});
+}
+
+// held = a latched force still acting after the pointer was released: the
+// poll loop keeps re-sending it so the scene follows the link if it moves
+let held = null;
+function clearForce() {
+  held = null;
+  drag = null;
+  controls.enabled = true;
+  arrow.visible = false;
+  anchor.visible = false;
+  fetch('/force', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ link: -1, f: [0, 0, 0] })
+  }).catch(() => {});
+}
+renderer.domElement.addEventListener('pointerup', endDrag);
+renderer.domElement.addEventListener('pointercancel', endDrag);
+
+// ---- live state ------------------------------------------------------------
+const el = (id) => document.getElementById(id);
+const status = el('status');
+let live = false;
+
+async function poll() {
+  if (drag) sendForce(drag.force);
+  else if (held) {
+    // re-send the latched force: the grab point follows the link it is
+    // attached to, and the request also keeps the server's copy fresh
+    const pt = linkGroups[held.link].localToWorld(held.local.clone());
+    anchor.position.copy(pt);
+    arrow.position.copy(pt);
+    const now = performance.now();
+    if (now - lastSent >= 33) {
+      lastSent = now;
+      const sf = toSim(held.force);
+      const sp = toSim(pt);
+      fetch('/force', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ link: held.link, p: [sp.x, sp.y, sp.z], f: [sf.x, sf.y, sf.z] })
+      }).catch(() => {});
+    }
+  }
+  try {
+    const paused = el('pause').checked;
+    const resp = await fetch(paused ? '/state?ticks=0' : '/state');
+    if (!resp.ok) throw new Error(String(resp.status));
+    const st = await resp.json();
+    for (let i = 0; i < st.links.length && i < linkGroups.length; i++) {
+      const p = st.links[i];
+      const g = linkGroups[i];
+      g.position.set(p[0], p[1], p[2]);
+      g.quaternion.set(p[4], p[5], p[6], p[3]);
+    }
+    el('t').textContent = st.t.toFixed(3);
+    el('ticks').textContent = st.ticks;
+    el('rtf').textContent = st.rtf.toFixed(3) + '×';
+    el('wall').textContent = st.wall_ms.toFixed(1);
+    // the HUD reads the local drag immediately and the server's copy as
+    // confirmation: a latched or in-flight press must not look like zero
+    const localF = drag ? drag.force.length() : (held ? held.force.length() : 0);
+    el('fmag').textContent = Math.max(st.ext.fmag, localF).toFixed(0);
+    el('comy').textContent = st.com[1].toFixed(4);
+    el('tilt').textContent = st.tilt.toFixed(3);
+    el('fz').textContent = `${st.fz[0].toFixed(0)} / ${st.fz[1].toFixed(0)}`;
+    el('bz').textContent = st.ext.base_z.toFixed(3);
+    if (!live) { live = true; status.textContent = '仿真在线'; status.className = ''; }
+    // frame on the first frame, and again right after a reset: the first
+    // frame may catch the robot already fallen (the server keeps running
+    // between page loads), and a camera aimed at a fallen pose puts the
+    // standing robot outside the viewport
+    if (!framed || reframe) { framed = true; reframe = false; frameCamera(); }
+  } catch (e) {
+    status.textContent = '服务器未响应（run examples/poke_serve.v）';
+    status.className = 'err';
+    await new Promise(r => setTimeout(r, 800));
+  }
+  // pace with a timer, not requestAnimationFrame: the latter stops in a
+  // backgrounded pane, which would freeze the simulation while it is not
+  // on screen
+  setTimeout(poll, 0);
+}
+
+// a test hook: the screen position of a link's origin (the canvas is not
+// in the DOM tree, so an automated check needs a way to aim at the robot)
+window.__pickAt = (x, y) => {
+  pointer.x = (x / innerWidth) * 2 - 1;
+  pointer.y = -(y / innerHeight) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const hits = raycaster.intersectObjects(linkGroups, true);
+  if (!hits.length) return null;
+  let obj = hits[0].object;
+  while (obj && obj.userData.linkIndex === undefined) obj = obj.parent;
+  return obj ? obj.userData.linkIndex : null;
+};
+window.__screenPoint = (i) => {
+  const g = linkGroups[i];
+  if (!g) return null;
+  const v = g.getWorldPosition(new THREE.Vector3()).project(camera);
+  return [Math.round((v.x + 1) / 2 * innerWidth), Math.round((1 - v.y) / 2 * innerHeight)];
+};
+
+el('reset').addEventListener('click', () => {
+  clearForce();
+  reframe = true;
+  fetch('/reset', { method: 'POST' }).then(() => setTimeout(() => { reframe = true; }, 400)).catch(() => {});
+});
+el('clear').addEventListener('click', clearForce);
+
+let framed = false;
+let reframe = false;
+// frame the camera on the first REAL frame: before any /state the link
+// groups all sit at the origin, so a bounding box taken then is the union
+// of the mesh offsets, not the robot's standing extent (measured: the
+// pelvis projected above the viewport)
+function frameCamera() {
+  const bbox = new THREE.Box3().setFromObject(worldRoot);
+  const c = bbox.getCenter(new THREE.Vector3());
+  const size = bbox.getSize(new THREE.Vector3());
+  controls.target.set(c.x, size.y * 0.5, c.z);
+  const dist = Math.max(1.6, size.length() * 1.5);
+  camera.position.set(c.x + dist * 0.5, size.y * 0.62, c.z + dist * 0.7);
+  controls.update();
+}
+
+async function boot() {
+  // a fresh page starts with no force: the server holds the last injected
+  // wrench, and a reload must not leave a push acting on the scene
+  fetch('/force', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ link: -1, f: [0, 0, 0] })
+  }).catch(() => {});
+  const resp = await fetch('/scene');
+  const def = await resp.json();
+  for (let i = 0; i < def.links.length; i++) {
+    await buildLink(def.links[i], palette[i % palette.length]);
+  }
+  poll();
+}
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+const clock = new THREE.Clock();
+function render() {
+  requestAnimationFrame(render);
+  controls.update();
+  renderer.render(scene, camera);
+}
+boot();
+render();
+</script>
+</body>
+</html>

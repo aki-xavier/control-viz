@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>simu scrub player</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #10141a; }
+  #ui {
+    position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 16px;
+    background: rgba(16,20,26,.85); color: #cfd8e3;
+    font: 13px/1.6 -apple-system, "SF Pro", "PingFang SC", sans-serif;
+    display: flex; gap: 12px; align-items: center; z-index: 10;
+  }
+  #slider { flex: 1; }
+  button, select {
+    background: #22303f; color: #cfd8e3; border: 1px solid #3a4a5c;
+    border-radius: 5px; padding: 3px 10px; cursor: pointer;
+  }
+  #info { min-width: 220px; text-align: right; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <button id="play">▶</button>
+  <select id="speed">
+    <option value="0.25">0.25×</option>
+    <option value="0.5">0.5×</option>
+    <option value="1" selected>1×</option>
+    <option value="2">2×</option>
+    <option value="4">4×</option>
+  </select>
+  <input id="slider" type="range" min="0" max="0" value="0" step="1">
+  <span id="info">loading…</span>
+</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/three.module.js",
+    "three/addons/loaders/STLLoader.js": "/lib/STLLoader.js",
+    "three/addons/controls/OrbitControls.js": "/lib/OrbitControls.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const params = new URLSearchParams(location.search);
+const recName = params.get('rec') || 'duck';
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x10141a);
+scene.fog = new THREE.Fog(0x10141a, 0.6, 2.2);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 1e-4, 20);
+camera.position.set(0.35, 0.28, 0.35);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.05, 0.1);
+controls.enableDamping = true;
+
+scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x203040, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.position.set(0.4, 0.5, 0.6);
+scene.add(sun);
+
+const grid = new THREE.GridHelper(0.4, 40, 0x2c3e50, 0x1c2836);
+scene.add(grid);
+scene.add(new THREE.AxesHelper(0.05));
+// a visible floor surface at the sim ground (z=0 in sim coords, the
+// three.js XZ plane after the worldRoot convention): the bare grid reads
+// as a reference line, not as something to stand on
+const floorMat = new THREE.MeshStandardMaterial({
+  color: 0x1a2531,
+  metalness: 0.0,
+  roughness: 0.95,
+  transparent: true,
+  opacity: 0.9
+});
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 0.6), floorMat);
+floor.rotation.x = -Math.PI / 2; // XZ plane (sim's xy ground)
+scene.add(floor);
+// a slightly warmer rim so the floor's extent is legible in the dark scene
+const rim = new THREE.Mesh(
+  new THREE.RingGeometry(0.29, 0.3, 48),
+  new THREE.MeshBasicMaterial({ color: 0x3a4f68, side: THREE.DoubleSide })
+);
+rim.rotation.x = -Math.PI / 2;
+scene.add(rim);
+// the sim world is z-up (robotics convention); three.js is y-up. Rotate
+// all content into three.js convention so the robots stand upright.
+const worldRoot = new THREE.Group();
+worldRoot.rotation.x = -Math.PI / 2;
+scene.add(worldRoot);
+
+const palette = [0x8ab4f8, 0xf6c177, 0x9ad1a9, 0xf28b82, 0xc5a3ff, 0x76d7c4,
+                 0xf9e2af, 0xa3c9f1, 0xefb1d2, 0xb7e3c0, 0xd0b49e, 0x93b8c4,
+                 0xd7aefb, 0x9fb8ad, 0xe8c39e];
+const loader = new STLLoader();
+const linkGroups = [];   // per dynamic link: { group, visuals:[{mesh, op, oq}] }
+const info = document.getElementById('info');
+const slider = document.getElementById('slider');
+const playBtn = document.getElementById('play');
+const speedSel = document.getElementById('speed');
+
+function makeVisual(v, color) {
+  return new Promise((resolve) => {
+    loader.load(v.mesh, (geom) => {
+      const mat = new THREE.MeshStandardMaterial({ color, metalness: 0.15, roughness: 0.75 });
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.position.set(v.op[0], v.op[1], v.op[2]);
+      mesh.quaternion.set(v.oq[1], v.oq[2], v.oq[3], v.oq[0]);
+      const sc = v.scale || [1, 1, 1];
+      mesh.scale.set(sc[0], sc[1], sc[2]);
+      resolve(mesh);
+    }, undefined, () => resolve(null));
+  });
+}
+
+async function buildLink(linkDef, color) {
+  const group = new THREE.Group();
+  const jobs = linkDef.visuals.map(v => makeVisual(v, color));
+  for (const mesh of await Promise.all(jobs)) {
+    if (mesh) group.add(mesh);
+  }
+  worldRoot.add(group);
+  return group;
+}
+
+let rec = null;
+let frame = 0;
+let playing = false;
+let lastT = 0;
+
+function applyFrame(i) {
+  if (!rec || i < 0 || i >= rec.frames.length) return;
+  frame = i;
+  const fr = rec.frames[i];
+  for (let li = 0; li < linkGroups.length; li++) {
+    const p = fr.poses[li];
+    const g = linkGroups[li];
+    g.position.set(p[0], p[1], p[2]);
+    g.quaternion.set(p[4], p[5], p[6], p[3]);
+  }
+  slider.value = i;
+  info.textContent = `f ${i}/${rec.frames.length - 1}  t=${fr.t.toFixed(3)}s`;
+}
+
+async function boot() {
+  const resp = await fetch(`/simrec/${recName}.jsonl`);
+  if (!resp.ok) {
+    info.textContent = `no simrec: /simrec/${recName}.jsonl (run the demo first)`;
+    return;
+  }
+  rec = await resp.json();
+  for (let li = 0; li < rec.links.length; li++) {
+    linkGroups.push(await buildLink(rec.links[li], palette[li % palette.length]));
+  }
+  for (const st of rec.statics || []) {
+    await buildLink(st, 0x5a6a7a);
+  }
+  slider.max = rec.frames.length - 1;
+  applyFrame(0);
+  info.textContent = `${recName}: ${rec.frames.length} frames`;
+  // fit the camera to the content's bounding box
+  const bbox = new THREE.Box3().setFromObject(scene);
+  const c = bbox.getCenter(new THREE.Vector3());
+  const s = bbox.getSize(new THREE.Vector3()).length();
+  controls.target.copy(c);
+  const dist = Math.max(0.12, s * 1.1);
+  camera.position.set(c.x + dist * 0.65, c.y + dist * 0.5, c.z + dist * 0.65);
+  controls.update();
+}
+
+slider.addEventListener('input', () => { playing = false; playBtn.textContent = '▶'; applyFrame(+slider.value); });
+playBtn.addEventListener('click', () => {
+  if (!rec) return;
+  playing = !playing;
+  playBtn.textContent = playing ? '⏸' : '▶';
+});
+
+const clock = new THREE.Clock();
+function tick() {
+  requestAnimationFrame(tick);
+  const dt = clock.getDelta();
+  if (playing && rec) {
+    lastT += dt * parseFloat(speedSel.value);
+    const step = Math.floor(lastT / rec.dt);
+    if (step > 0) {
+      lastT -= step * rec.dt;
+      applyFrame(Math.min(rec.frames.length - 1, frame + step));
+      if (frame >= rec.frames.length - 1) { playing = false; playBtn.textContent = '▶'; }
+    }
+  }
+  controls.update();
+  renderer.render(scene, camera);
+}
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+boot();
+tick();
+</script>
+</body>
+</html>

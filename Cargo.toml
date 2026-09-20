@@ -1,0 +1,19 @@
+# control-viz — the scrub player and the static server that feeds it, as a project of its own.
+#
+#   make test    # the route table's bytes, sent over a real socket
+#   make serve   # 127.0.0.1:8321, read-only (see the Makefile for the roots)
+#
+# No engine, no build.rs and no dependencies: the server is std's own TcpListener, and the page is
+# this crate's viz/ with the three.js pinned under viz/lib/ (whose README carries the sha256s).
+
+[package]
+name = "control-viz"
+description = "The scrub player and the static server that feeds it: the route table, the byte-exact responses and the player page with its pinned three.js. Pure serving, no engine and no model."
+version = "0.1.0"
+edition = "2021"
+# The stack's toolchain floor: the oldest compiler the sibling crates build and test with.
+rust-version = "1.87"
+license = "MIT"
+
+# No dependencies, Rust or native: std's TcpListener, std::fs, and the route table in lib.rs.
+[dependencies]
