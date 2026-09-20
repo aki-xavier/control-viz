@@ -3,8 +3,8 @@
 #   make test    # the route table's bytes, sent over a real socket
 #   make serve   # 127.0.0.1:8321, read-only (see the Makefile for the roots)
 #
-# No engine, no build.rs and no dependencies: the server is std's own TcpListener, and the page is
-# this crate's viz/ with the three.js pinned under viz/lib/ (whose README carries the sha256s).
+# No engine, no build.rs and no runtime dependency: the server is std's own TcpListener, and the page
+# is this crate's viz/ with the three.js pinned under viz/lib/ (whose README carries the sha256s).
 
 [package]
 name = "control-viz"
@@ -15,5 +15,10 @@ edition = "2021"
 rust-version = "1.87"
 license = "MIT"
 
-# No dependencies, Rust or native: std's TcpListener, std::fs, and the route table in lib.rs.
+# No runtime dependency, Rust or native: std's TcpListener, std::fs, and the route table in lib.rs.
 [dependencies]
+
+# DEV-only: the comment rules, which this crate's own prose is held to (tests/comment_why.rs). It reads
+# text, has no dependencies of its own, and nothing that depends on this crate links it.
+[dev-dependencies]
+comment-why = { path = "../comment-why" }
