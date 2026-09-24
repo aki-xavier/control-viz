@@ -15,3 +15,6 @@
 *.swo
 *~
 .zcode/
+
+# CodeGraph index
+.codegraph/
