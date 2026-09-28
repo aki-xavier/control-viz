@@ -1,89 +1,64 @@
-# control-viz — the scrub player and the static server that feeds it
+# control-viz — 擦洗播放器与喂给它的静态服务器
 
-A project of its own: the player page, the server that hands it out, and the route table and the
-response bytes in between. MIT-licensed (see `LICENSE`). No engine, no model and no dependencies —
-`std`'s `TcpListener`, `std::fs`, and nothing else.
+control 仿神经五层架构中的**可视化辅助层**:一个独立的只读静态服务器,外加本 crate 自带的播放器页面。MIT 许可(见 `LICENSE`)。
 
-It was `z1-arm`'s `examples/viz_serve.rs` and `g1-biped`'s `papers/viz/` until 2026-09-20: the
-server had left with the arm and the page with the walk, so neither tree could serve a frame, and
-the server resolved both of its roots against its own crate directory (measured then: `/`,
-`/index.html`, `/lib/three.min.js` and `/?rec=duck` were all 404). The page and the server are one
-thing, and neither machine owns it.
+## 核心设计意图
 
-## What is here
+- **纯服务,无引擎、无模型**:服务器只做一件事——把 URL 映射到文件并原样回字节。不包含任何仿真、动力学或状态;它只是 std 的 `TcpListener` 加一张固定的路由表。
+- **页面与服务器是一体**:播放器页面 `viz/` 随本 crate 发布(含 `viz/lib/` 下按 sha256 钉死的 three.js),服务器是唯一知道如何把它们送出去的进程。二者曾经分属不同仓库,导致任何一边都无法独立播出一帧,因此合并为本 crate。
+- **三个根目录都是调用方传入的**:服务器回答三类内容——本 crate 的播放器页面、`control-model` 的网格文件、机器侧(如 `g1-biped` 的 `g1_stand_viz`)写出的录制文件。后两类的目录由启动参数指定,本 crate 是叶子节点,不持有也不复制兄弟 crate 的路径约定;录制文件按 URL 引用网格(`/models/unitree_g1/meshes/pelvis.STL`),所以模型根就是这些名字的解析基准。
+- **钉死的是"答案"而非实现**:路由表、每种扩展名的 MIME 类型、响应的精确字节(含响应头)是本 crate 的契约。`tests/serve.rs` 用真实 socket 驱动一个实际启动的服务器进程,逐字节比对每种形态的响应;HTTP 只讲 `Connection: close`、一连接一请求,任何响应头的增删或重排都是测试失败。
+- **两种 404 刻意不同**:路由表拒绝的 URL 回答 `not found: <url>`,文件不存在的回答 `missing: <path>`——"播放器没有这条路由"与"录制还没写出来"是两种不同的错误,后者正是用 `?rec=` 打开页面时会遇到的情况。
 
-```text
-src/lib.rs      the route table (resolve), the mime type per extension, the response bytes
-                (Response::to_bytes) and the answer to one request (handle)
-src/main.rs     the command line and the accept loop: one request per connection — read the
-                request line, answer it, close
-viz/            the player: index.html (the scrub player — timeline drag, play, speed, orbit
-                camera), poke.html (mouse force injection) and lib/, the vendored three.js r160
-                whose three files viz/lib/README.md pins by sha256
-tests/serve.rs  the oracle: a spawned server, a real socket, and the exact bytes of each answer
+## 模块依赖拓扑
+
+crate 内只有两个编译目标:库(`src/lib.rs`,全部逻辑)与二进制(`src/main.rs`,命令行与 accept 循环)。依赖单向、无环:
+
+```mermaid
+graph LR
+    main["control-viz (bin)<br/>src/main.rs<br/>CLI 解析 · accept 循环 · 传输层"]
+    lib["control_viz (lib)<br/>src/lib.rs<br/>路由表 resolve · MIME · Response 字节 · handle"]
+    main -->|handle, Roots, DEFAULT_ADDR| lib
+    lib --> std["std (fs / path)"]
+    main --> std2["std (net / io)"]
 ```
 
-## The three roots it serves
+职责切分:`lib.rs` 是纯函数,不碰 socket,因此测试无需网络即可约束路由与响应字节;`main.rs` 只是包在外面的传输层——读一行请求、回答、关闭。
 
-The server answers three things, and only the first is this crate's:
+## 信号流
 
-- **the player** — `/`, `/index.html`, `/poke.html` and `/lib/*`, from this crate's own `viz/`;
-- **the recordings** — `/simrec/*.jsonl`, written by the machine side: `../g1-biped`'s `g1_stand_viz`
-  writes `/tmp/simrec/<name>.jsonl`, and the player fetches `/simrec/<rec>.jsonl` for its `?rec=`
-  parameter (default `duck`);
-- **the meshes** — `/models/*`, which are `../control-model`'s data. A recording names them **by
-  URL** (`/models/unitree_g1/meshes/pelvis.STL`), so `--models` is the directory those names are
-  relative to and not the `models/` parent.
+```mermaid
+sequenceDiagram
+    participant B as 浏览器 (viz/index.html)
+    participant M as main.rs (accept 循环)
+    participant L as lib.rs (handle)
+    participant F as 文件系统 (三根目录)
 
-All three are arguments, not paths spelled in the binary: a relative path compiled into a binary is
-a claim about a checkout layout that holds only on the machine it was written on.
-
-```text
---viz <dir>         the player page directory                   [<crate>/viz]
---models <dir>      the mesh directory `/models/` names under    [../control-model/models]
---simrec <dir>      the recordings directory                     [/tmp/simrec]
---addr <addr>       the address to serve on                      [127.0.0.1:8321]
---max-requests <n>  stop after n requests (0 = until killed)     [0]
+    B->>M: GET /?rec=g1_stand (TCP 连接)
+    M->>L: handle(roots, target)
+    L->>L: resolve: 去 query · 拒 `..` · 路由表匹配
+    L->>F: fs::read(解析后的路径)
+    F-->>L: 文件字节 / 不存在
+    L-->>M: Response{status, ctype, body}
+    M->>B: to_bytes() 精确字节, Connection: close
+    Note over M: 一连接一请求, 回答即关闭
+    B->>M: GET /simrec/g1_stand.jsonl
+    B->>M: GET /models/unitree_g1/meshes/pelvis.STL
+    Note over B: 录制按 URL 引用网格,<br/>播放器逐帧擦洗播放
 ```
 
-A root that is not there is not fatal — the player is only reachable once a recording exists, and
-the recording is another project's — so startup warns once per missing root on stderr rather than
-refusing to listen.
+## 对外依赖与理由
 
-## Running it
+- **Rust 运行时依赖:无**。服务器只用 `std::net::TcpListener`、`std::fs` 与 `std::path`;没有 build.rs,没有原生库。可视化层必须是整个架构里最容易构建、最不可能坏的一环。
+- **three.js(viz/lib/, vendored)**:播放器唯一的第三方资产,按文件随 crate 携带并由 `viz/lib/README.md` 记录 sha256——页面离线可用,版本不受 CDN 与网络影响。
+- **数据源(非代码依赖)**:`/models/*` 默认指向 `../control-model/models`,`/simrec/*` 默认指向 `/tmp/simrec`(`g1-biped` 的 `g1_stand_viz` 的写入位置),均可用 `--models` / `--simrec` 覆盖。这是目录约定而非链接依赖:本 crate 不 import 任何兄弟 crate。
 
-The player needs a recording to scrub, and the recording is the machine's:
+## 使用
 
 ```sh
-# in ../g1-biped: steps the standing loop on the engine, writes /tmp/simrec/g1_stand.jsonl
-mbx run --release --example g1_stand_viz
-
-# here: the player, then open http://127.0.0.1:8321/?rec=g1_stand
-make serve
+make test    # 路由表逐字节验证(真实 socket)
+make lint    # rustfmt --check + clippy
+make serve   # 127.0.0.1:8321, 只读; ARGS="--simrec /tmp/elsewhere" 可覆盖参数
 ```
 
-`--max-requests` is the stop condition a test wants: the server serves that many requests and exits,
-which is what `tests/serve.rs` drives. Its `--addr 127.0.0.1:0` is the other half of it — the OS
-chooses a port and the startup line reports the one it bound, so no test picks a port and hopes.
-
-## The route table
-
-| route | path | served from |
-|---|---|---|
-| `/`, `/index.html`, `/poke.html` | that file | `--viz` |
-| `/lib/<rest>` | `<viz>/lib/<rest>` | `--viz` |
-| `/simrec/<rest>` | `<simrec>/<rest>` | `--simrec` |
-| `/models/<rest>` | `<models>/<rest>` | `--models` |
-| anything else | — | 404 |
-
-A URL carrying `..` is refused before any route is applied. The two 404s are distinct on purpose:
-`not found: <url>` is a route the table rejects, `missing: <path>` is a file that is not there — and
-the second is the one a reader of `?rec=` hits when the recording has not been written. Responses
-carry `Connection: close` and one request is served per connection; `tests/serve.rs` compares those
-bytes literally, headers included, so a header added or reordered fails rather than surprises.
-
-One departure from the server this replaces: extensions are matched case-insensitively. The model
-tree is not consistent about it (the meshes a recording names are `.STL` while their neighbours are
-`.stl`), and the old table matched as written, so every recorded mesh went out as `text/plain`.
-`STLLoader` parses the bytes and ignores the header, which is why that went unnoticed rather than
-why it was right.
+启动后打开 `http://127.0.0.1:8321/?rec=<录制名>`(不带 `.jsonl` 后缀)。`--addr 127.0.0.1:0` 让操作系统分配端口,实际端口打印在启动行。

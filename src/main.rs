@@ -1,10 +1,3 @@
-// main.rs — the command line and the accept loop. The route table and the response bytes are
-// lib.rs's, so the tests can hold them to their word without a socket; this file is the transport
-// around them: read one request line, answer it, close.
-//
-// The roots are arguments rather than paths spelled here: the player page is this crate's, but the
-// meshes are control-model's and the recordings are g1-biped's, and a relative path compiled into a
-// binary is a claim about a checkout layout that only holds on the machine it was written on.
 
 use control_viz::{handle, Roots, DEFAULT_ADDR};
 use std::io::{Read, Write};
@@ -57,9 +50,6 @@ fn main() {
         }
     }
 
-    // A root that is not there is not fatal — the page is only reachable once the recording exists,
-    // and the recording is written by another project — but it is the first thing to check when a
-    // request 404s, so it is said once at startup rather than left to the bodies.
     for (flag, dir) in [
         ("--viz", &roots.viz),
         ("--models", &roots.models),
@@ -80,8 +70,6 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // The BOUND address, not the requested one: `--addr 127.0.0.1:0` asks the OS for a port and this
-    // line is how the caller learns which one it got.
     let bound = listener
         .local_addr()
         .expect("a bound listener has an address");
@@ -93,9 +81,8 @@ fn main() {
             Ok(stream) => stream,
             Err(_) => continue,
         };
-        // a request this server cannot read is dropped without a response
-        let (_, target) = match read_request(&mut stream) {
-            Some(request) => request,
+        let target = match read_request(&mut stream) {
+            Some(target) => target,
             None => continue,
         };
         let _ = stream.write_all(&handle(&roots, &target).to_bytes());
@@ -107,7 +94,6 @@ fn main() {
     }
 }
 
-/// The value after a flag, or a usage error.
 fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> String {
     args.next()
         .unwrap_or_else(|| fail(&format!("{flag} needs a value")))
@@ -118,9 +104,7 @@ fn fail(message: &str) -> ! {
     std::process::exit(2)
 }
 
-/// Reads one request line and returns its method and target; the head's remaining lines and any body
-/// are left unread. A client that connects and closes, or a line over the 64 KiB cap, answers None.
-fn read_request(stream: &mut TcpStream) -> Option<(String, String)> {
+fn read_request(stream: &mut TcpStream) -> Option<String> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     while !buf.contains(&b'\n') {
@@ -136,7 +120,6 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, String)> {
     let line_end = buf.iter().position(|c| *c == b'\n').unwrap_or(buf.len());
     let line = String::from_utf8_lossy(&buf[..line_end]).to_string();
     let mut parts = line.trim_end_matches('\r').split(' ');
-    let method = parts.next().unwrap_or("").to_string();
-    let target = parts.next().unwrap_or("").to_string();
-    Some((method, target))
+    parts.next();
+    Some(parts.next().unwrap_or("").to_string())
 }

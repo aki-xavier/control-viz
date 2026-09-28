@@ -1,25 +1,15 @@
-// serve.rs — the route table's answers, byte for byte.
-//
-// The oracle here is a spawned server driven over a real socket, not a call into the route table:
-// what a reader of `?rec=` gets is the bytes on the wire, headers included, and those are what this
-// file pins. One case per shape of answer — the page, the libs, the meshes, the recording, a
-// recording that has not been written, a route the table rejects, and a `..` path.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-/// The fixture's files, written under the integration tests' own temporary directory.
 const PAGE: &[u8] = b"<!DOCTYPE html>\n<html><body>player</body></html>\n";
 const POKE: &[u8] = b"<!DOCTYPE html>\n<html><body>poke</body></html>\n";
 const LIB: &[u8] = b"// three.module.js (the vendored build, truncated for the fixture)\n";
 const MESH: &[u8] = b"solid pelvis\nendsolid pelvis\n";
 const RECORDING: &[u8] = b"{\"dt\":0.02,\"links\":[],\"statics\":[],\"frames\":[]}\n";
 
-/// Writes the three roots and returns them: the player page, the meshes the recordings name, and
-/// the recordings. `name` separates the tests' fixtures — they run in parallel and each owns its
-/// own tree.
 fn fixture(name: &str) -> (PathBuf, PathBuf, PathBuf) {
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("serve_fixture_{name}"));
     let _ = std::fs::remove_dir_all(&root);
@@ -46,8 +36,6 @@ fn fixture(name: &str) -> (PathBuf, PathBuf, PathBuf) {
     (viz, models, simrec)
 }
 
-/// The exact bytes of one answer: status line, content type when there is one, length, the
-/// connection header, and the body.
 fn expected(status: &str, ctype: Option<&str>, body: &[u8]) -> Vec<u8> {
     let mut out = format!("HTTP/1.1 {status}\r\n");
     if let Some(t) = ctype {
@@ -60,7 +48,6 @@ fn expected(status: &str, ctype: Option<&str>, body: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// One request on its own connection; the server answers one per connection and closes.
 fn request(addr: &str, target: &str) -> Vec<u8> {
     let mut stream = TcpStream::connect(addr).expect("the server's address");
     stream
@@ -71,7 +58,6 @@ fn request(addr: &str, target: &str) -> Vec<u8> {
     response
 }
 
-/// Spawns the server on an OS-chosen port and returns it with the address it reports.
 fn spawn(viz: &Path, models: &Path, simrec: &Path, max_requests: usize) -> (Child, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_control-viz"))
         .args([
@@ -94,7 +80,6 @@ fn spawn(viz: &Path, models: &Path, simrec: &Path, max_requests: usize) -> (Chil
     BufReader::new(child.stdout.take().expect("the server's stdout"))
         .read_line(&mut line)
         .expect("the startup line");
-    // `control-viz: listening on http://127.0.0.1:<port>/  (player: ...)`
     let rest = line
         .split("listening on http://")
         .nth(1)
@@ -129,8 +114,6 @@ fn the_route_tables_answers_are_the_expected_bytes() {
             "/simrec/g1_stand.jsonl",
             expected("200 OK", Some("application/json"), RECORDING),
         ),
-        // the recording the player was asked for has not been written yet: a different 404 from a
-        // route the table does not have, and it names the path so the reader knows which root moved
         (
             "/simrec/not_written.jsonl",
             expected(
@@ -150,8 +133,6 @@ fn the_route_tables_answers_are_the_expected_bytes() {
     ];
 
     let (mut child, addr) = spawn(&viz, &models, &simrec, cases.len());
-    // every answer is collected before anything is asserted, so a failing case cannot leave the
-    // server waiting on a request this test no longer sends
     let got: Vec<(String, Vec<u8>)> = cases
         .iter()
         .map(|(target, _)| (target.to_string(), request(&addr, target)))
